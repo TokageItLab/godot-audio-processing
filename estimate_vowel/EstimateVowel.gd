@@ -8,8 +8,8 @@ enum Vowel {
     O
 }
 
-const UPDATE_FRAME: int = 5
-const FFT_SAMPLES: int = 1024 # Needs 2^n
+const UPDATE_FRAME: int = 5 # getting the recording stream again at a rate of 4 frames or less caused error, WTF
+const FFT_SAMPLES: int = 1024 # needs 2^n
 
 const GRAPH_LENGTH: float = 640.0
 const GRAPH_SCALE: float = 200.0
@@ -17,14 +17,81 @@ const GRAPH_SCALE: float = 200.0
 const DYNAMIC_RANGE: float = 100.0 # assuming the min value of db
 const INV_DYNAMIC_RANGE: float = 1.0 / DYNAMIC_RANGE # for reducing calculation
 const PI2: float = 2.0 * PI
+const INV_255: float = 1.0 / 255.0
 const INV_32767: float = 1.0 / 32767.0
 const INV_LOG10: float = 1.0 / log(10)
+
+# Vector2(freq, value ratio)
+const ESTIMATE_DB: Dictionary = {
+    "peak3": {
+        "A": [
+            Vector2(18, 1.0),
+            Vector2(41, 0.9),
+            Vector2(85, 0.75)
+        ],
+        "I": [
+            Vector2(21, 1.0),
+            Vector2(42, 1.1),
+            Vector2(84, 1.0)
+        ],
+        "U": [
+            Vector2(19, 1.0),
+            Vector2(47, 0.65),
+            Vector2(84, 0.7)
+        ],
+        "E": [
+            Vector2(21, 1.0),
+            Vector2(60, 0.75),
+            Vector2(84, 0.65)
+        ],
+        "O": [
+            Vector2(20, 1.0),
+            Vector2(63, 0.9),
+            Vector2(85, 0.8)
+        ]
+    },
+    "peak4": {
+        "A": [
+            Vector2(18, 1.0),
+            Vector2(41, 0.9),
+            Vector2(68, 0.7),
+            Vector2(85, 0.55)
+        ],
+        "I": [
+            Vector2(21, 1.0),
+            Vector2(42, 1.1),
+            Vector2(60, 1.0),
+            Vector2(84, 1.1)
+        ],
+        "U": [
+            Vector2(20, 1.0),
+            Vector2(39, 0.7),
+            Vector2(65, 0.6),
+            Vector2(84, 0.75)
+        ],
+        "E": [
+            Vector2(22, 1.0),
+            Vector2(43, 0.9),
+            Vector2(66, 0.7),
+            Vector2(84, 0.65)
+        ],
+        "O": [
+            Vector2(20, 1.0),
+            Vector2(39, 0.9),
+            Vector2(63, 0.75),
+            Vector2(85, 0.8)
+        ]
+    }
+}
 
 var effect: AudioEffectRecord
 var audio_sample: AudioStreamSample
 var is_recording: bool = false
 var buffer: int = UPDATE_FRAME
 
+var before_sample_array: Array = []
+var peaks3_log: Array = []
+var peaks4_log: Array = []
 var vowel_log: Array = [-1, -1, -1]
 var estimate_log: Array = [-1, -1, -1]
 
@@ -37,6 +104,12 @@ func print_max(sample_array: Array):
     for i in range(sample_array.size()):
         vmax = max(vmax, abs(sample_array[i]))
     print(vmax)
+    return
+func print_min(sample_array: Array):
+    var vmin: float = 1.0;
+    for i in range(sample_array.size()):
+        vmin = min(vmin, abs(sample_array[i]))
+    print(vmin)
     return
 
 # (Caution!) plotting many points cause unstable.
@@ -122,6 +195,13 @@ func array_normalize(sample_array: Array):
 # functions for FFT #
 #####################
 
+# smoothing
+func smoothing(sample_array: Array):
+    var n = sample_array.size();
+    for i in range(n):
+        sample_array[i] = (sample_array[i] + before_sample_array[i]) * 0.5
+    return
+
 # hamming window
 func hamming(sample_array: Array):
     var n = sample_array.size();
@@ -132,7 +212,7 @@ func hamming(sample_array: Array):
     sample_array[n - 1] = 0
     return;
 
-# real FFT (wrapping fft())
+# real FFT (wrap fft())
 func rfft(sample_array: Array, reverse: bool = false, positive: bool = true):
     var n: int = sample_array.size()
     var cmp_array = []
@@ -170,21 +250,6 @@ func fft(a: Array, reverse: bool):
         a[i] = b[i % (N / 2)] + ComplexCalc.cmlt(c[i % (N / 2)], ComplexCalc.cexp(Vector2(0, circle * float(i) / float(N))));
     return
 
-# fir filter
-# reference (https://aidiary.hatenablog.com/entry/20111023/1319334639)
-func fir(sample_array: Array, filter_array: Array):
-    var out = []
-    var L: int = sample_array.size()
-    var N: int = filter_array.size() - 1
-    for i in range(L):
-        out.append(0.0)
-    for n in range(L):
-        for i in range(N):
-            if n - i >= 0:
-                out[n] += filter_array[i] * sample_array[n - i]
-    sample_array = out.duplicate()
-    return sample_array
-
 # lifter
 func lifter(sample_array: Array, level: int):
     var i_min: int = level
@@ -194,170 +259,117 @@ func lifter(sample_array: Array, level: int):
             sample_array[i] = 0.0
     return
 
+# filter
+func filter(sample_array: Array, lowcut: int, highcut: int):
+    var minimum = sample_array[0]
+    for i in range(sample_array.size()):
+        minimum = min(minimum, sample_array[i])
+    if minimum == 0.0:
+        minimum == 0.000001 # avoid log(0)
+    for i in range(sample_array.size()):
+        if i <= lowcut || i >= highcut:
+            sample_array[i] = minimum
+
 ##########################
 # functions for Lip Sync #
 ##########################
 
-# get peak and sort
-# experimentally, sorting of the peak values.
-# the algorithm varies (need sorting or not) from person to person.
-func get_peak(sample_array: Array, threshold: float) -> Array:
+# get peaks
+func get_peaks(sample_array: Array, threshold: float) -> Array:
     var n: int = sample_array.size() - 1
     var i: int = 1
     var j: int = 0
     var tmp: Vector2 = Vector2.ZERO
-    var idx_array: Array = []
-    var val_array: Array = []
-    # 0
-    if sample_array:
-        if sample_array[0] > sample_array[1]:
-            idx_array.append(0)
-            val_array.append(sample_array[0])
-    # > 0
+    var out: Array = []
+    var div: float = 1.0
     while i < n:
         if (
             (sample_array[i] > threshold) &&
             (sample_array[i] > sample_array[i - 1]) &&
             (sample_array[i] > sample_array[i + 1])
         ):
-            idx_array.append(i)
-            val_array.append(sample_array[i])               
+            if out.size() > 0:
+                out.append(Vector2(i, sample_array[i] * div))
+            else:
+                out.append(Vector2(i, 1.0))
+                div = 1.0 / sample_array[i]
         i += 1
-    # sort
-    n = idx_array.size() - 1
-    i = 0
-    while i < n:
-        j = n
-        while j > i:
-            if val_array[j-1] < val_array[j]:
-                tmp = Vector2(val_array[j-1], idx_array[j-1])
-                val_array[j-1] = val_array[j]
-                idx_array[j-1] = idx_array[j]
-                val_array[j] = tmp.x
-                idx_array[j] = tmp.y
-            j -= 1
-        i += 1
-    return idx_array
+    return out
+
+# get peaks average
+func get_peaks_average(size: int) -> Array:
+    var out: Array = []
+    var i: int = 1
+    var j: int = 0
+    var div: float = 1.0
+    match size:
+        3:
+            out = peaks3_log[0]
+            while i < peaks3_log.size():
+                j = 0
+                while j < out.size():
+                    out[j].x += peaks3_log[i][j].x
+                    out[j].y += peaks3_log[i][j].y
+                    j += 1
+                i += 1
+            div = 1.0 / peaks3_log.size()
+        4:
+            out = peaks4_log[0]
+            while i < peaks4_log.size():
+                j = 0
+                while j < out.size():
+                    out[j].x += peaks4_log[i][j].x
+                    out[j].y += peaks4_log[i][j].y
+                    j += 1
+                i += 1
+            div = 1.0 / peaks4_log.size()
+    for k in range(out.size()):
+        out[k] *= div
+    return out
+
+# get distance from vowel DB
+func get_distance_from_db(peaks: Array) -> Array:
+    var out: Array = []
+    var vowel: Array = ["A", "I", "U", "E", "O"]
+    var peak_estm: Dictionary = {}
+    var dist: float = 0.0
+    match(peaks.size()):
+        3:
+            peak_estm = ESTIMATE_DB["peak3"]
+        4:
+            peak_estm = ESTIMATE_DB["peak4"]
+    for i in range(vowel.size()):
+        dist = 0.0
+        for j in range(peaks.size()):
+            dist += abs(peak_estm[vowel[i]][j].x - peaks[j].x) * INV_255 + abs(peak_estm[vowel[i]][j].y - peaks[j].y)
+        out.append(dist)
+    return out
 
 # estimate vowel by peak (too roughly)
 func estimate_vowel(sample_array: Array) -> int:
     var out: Array = []
-    var peaks: Array = get_peak(sample_array, 0.1)
+    var peaks: Array = get_peaks(sample_array, 0.1)
 
-    # about...
-    # A : 8, 19, 35
-    # I : 6, 80, 47
-    # U : 6, 20, 34
-    # E : 7, 34, 47
-    # O : 8, 36
-
-    # O
-    if (
-        peaks.size() == 1 &&
-        peaks[0] >= 0 && peaks[0] <= 7
-    ) || (
-        peaks.size() == 2 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 30 && peaks[1] <= 45
-    ) || (
-        peaks.size() == 3 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 30 && peaks[1] <= 45 &&
-        peaks[2] >= 45 && peaks[2] <= 90
-    ):
-        return Vowel.O
-
-    # A
-    elif (
-        peaks.size() == 2 &&
-        peaks[0] >= 8 && peaks[0] <= 10 &&
-        peaks[1] >= 15 && peaks[1] <= 77
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 8 && peaks[0] <= 10 &&
-        peaks[1] >= 15 && peaks[1] <= 77 &&
-        peaks[2] >= 34 && peaks[2] <= 200
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 8 && peaks[0] <= 10 &&
-        peaks[1] >= 34 && peaks[1] <= 200 &&
-        peaks[2] >= 15 && peaks[2] <= 77
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 15 && peaks[0] <= 77 &&
-        peaks[1] >= 8 && peaks[1] <= 10 &&
-        peaks[2] >= 34 && peaks[2] <= 200
-    ):
-        return Vowel.A
-
-    # E
-    elif (
-        peaks.size() >= 3 &&
-        peaks[0] >= 0 && peaks[0] <= 9 &&
-        peaks[1] >= 24 && peaks[1] <= 38 &&
-        peaks[2] >= 20 && peaks[2] <= 79
-    ):
-        return Vowel.E
+    if peaks.size() != 3 && peaks.size() != 4:
+        return -1    
+    push_peaks(peaks)
+    var peaks_ave: Array = get_peaks_average(peaks.size())
+    print(peaks_ave)
     
-    # I
-    elif (
-        peaks.size() >= 3 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 32 && peaks[1] <= 79 &&
-        peaks[2] >= 47 && peaks[2] <= 120 
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 47 && peaks[0] <= 120 &&
-        peaks[1] >= 0 && peaks[1] <= 7 &&
-        peaks[2] >= 32 && peaks[2] <= 79
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 47 && peaks[1] <= 120 &&
-        peaks[2] >= 32 && peaks[2] <= 79
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 32 && peaks[0] <= 79 &&
-        peaks[1] >= 0 && peaks[1] <= 7 &&
-        peaks[2] >= 47 && peaks[2] <= 120
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 32 && peaks[0] <= 79 &&
-        peaks[1] >= 47 && peaks[1] <= 90 &&
-        peaks[2] >= 0 && peaks[2] <= 7         
-    ):
-        return Vowel.I
-    
-    # U
-    elif (
-        peaks.size() == 2 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 15 && peaks[1] <= 77
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 15 && peaks[1] <= 37 &&
-        peaks[2] >= 32 && peaks[2] <= 77
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 0 && peaks[0] <= 7 &&
-        peaks[1] >= 32 && peaks[1] <= 77 &&
-        peaks[2] >= 15 && peaks[2] <= 37
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 15 && peaks[0] <= 37 &&
-        peaks[1] >= 0 && peaks[1] <= 7 &&
-        peaks[2] >= 32 && peaks[2] <= 77
-    ) || (
-        peaks.size() >= 3 &&
-        peaks[0] >= 32 && peaks[0] <= 77 &&
-        peaks[1] >= 0 && peaks[1] <= 7 &&
-        peaks[2] >= 15 && peaks[2] <= 37
-    ):
-        return Vowel.U
+    var distance_vowel: Array = get_distance_from_db(peaks_ave)
+    print(distance_vowel)
+
+    var i: int = 1
+    var min_distance: float = distance_vowel[0]
+    var min_idx = 0
+    while i < 5:
+        if distance_vowel[i] < min_distance:
+            min_distance = distance_vowel[i]
+            min_idx = i
+        i += 1
 
     # unknown
-    return -1
+    return min_idx
 
 # estimate and complement (wrap estimate_vowel()
 func get_vowel(sample_array: Array, amount: float) -> Dictionary:
@@ -369,6 +381,8 @@ func get_vowel(sample_array: Array, amount: float) -> Dictionary:
             return {"estimate": current, "vowel": vowel_log[0] if vowel_log[0] != -1 else randi() % 5}
 
     # stabilize
+    # now if (current == estimate_log[0]) will stabilize while 1 frame
+    # so if (current == estimate_log[0] && current == estimate_log[1]) will stabilize while 2 frame
     if vowel_log.size() > 2:
         if current == estimate_log[0]:
             return {"estimate": current, "vowel": current if current != -1 else randi() % 5}
@@ -378,6 +392,20 @@ func get_vowel(sample_array: Array, amount: float) -> Dictionary:
     return {"estimate": current, "vowel": randi() % 5}
 
 # log
+func push_peaks(peaks: Array) -> void:
+    if peaks.size() >= 4:
+        if peaks4_log.size() < 3:
+            peaks4_log.append(peaks)
+        else:
+            peaks4_log.push_front(peaks)
+            peaks4_log.pop_back()
+    elif peaks.size() >= 3:
+        if peaks3_log.size() < 3:
+            peaks3_log.append(peaks)
+        else:
+            peaks3_log.push_front(peaks)
+            peaks3_log.pop_back()
+    return
 func push_vowel(vowel: int) -> void:
     if vowel_log.size() < 3:
         vowel_log.append(vowel)
@@ -423,20 +451,25 @@ func _process(delta):
                     # FFT
                     if sample_array.size() >= FFT_SAMPLES:
                         sample_array = sample_array.slice(0, FFT_SAMPLES - 1)
-                        # FIR filter
-                        fir(sample_array, [1.0, -0.97])
                         # hamming
                         hamming(sample_array)
                         # to spectrum by FFT
                         rfft(sample_array)
                         sample_array = sample_array.slice(0, FFT_SAMPLES * 0.5)
+                        # smoothing
+                        if !before_sample_array.empty():
+                            smoothing(sample_array)
+                        before_sample_array = sample_array.duplicate()
+                        # filter
+                        filter(sample_array, 10, 95) # adjust for formant count
                         # log power scale
                         for i in range(sample_array.size()):
                             sample_array[i] = log(pow(sample_array[i], 2)) * INV_LOG10
+                        array_normalize(sample_array)
                         # to cepstrum by IFFT
                         rfft(sample_array, true, false)
                         # lifter
-                        lifter(sample_array, 40)
+                        lifter(sample_array, 26) # adjust for formant count
                         # to spectrum by FFT again
                         rfft(sample_array, false, false)
                         sample_array = sample_array.slice(0, FFT_SAMPLES * 0.25)
@@ -457,7 +490,7 @@ func _process(delta):
                         push_vowel(current_vowel["vowel"])
                         # draw
                         draw_vowel(current_vowel["vowel"], amount)
-                        # draw_graph(sample_array)
+                        draw_graph(sample_array)
             effect.set_format(AudioStreamSample.FORMAT_16_BITS)
             effect.set_recording_active(true)
             buffer = UPDATE_FRAME
