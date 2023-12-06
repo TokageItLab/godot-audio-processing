@@ -267,7 +267,7 @@ func filter(sample_array: Array, lowcut: int, highcut: int):
     if minimum == 0.0:
         minimum == 0.000001 # avoid log(0)
     for i in range(sample_array.size()):
-        if i <= lowcut || i >= highcut:
+        if sample_array[i] <= lowcut || sample_array[i] >= highcut:
             sample_array[i] = minimum
 
 ##########################
